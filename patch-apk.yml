@@ -1,0 +1,259 @@
+# À placer dans : .github/workflows/patch-apk.yml
+#
+# Principe : on importe un APK, le workflow le décompile (apktool),
+# injecte une petite classe "Tweaker" appelée au démarrage du jeu,
+# recompile, aligne et signe. Aucun ADB, aucun débogage.
+#
+# Réglages choisis au lancement (Actions > Patch APK > Run workflow) :
+#   saturation  : 0 normale / 1 légère / 2 moyenne / 3 forte / 4 max
+#   stretch_v   : étirement vertical   0..3  (+10 % par niveau)
+#   stretch_h   : étirement horizontal 0..3  (+10 % par niveau)
+#   render_res  : résolution de rendu 100 / 75 / 50 %
+
+name: Patch APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Lien direct vers l'APK (vide = utilise apk/game.apk du repo)"
+        required: false
+        default: ""
+      saturation:
+        description: "Saturation : 0=normale 1=légère(1.2) 2=moyenne(1.5) 3=forte(1.8) 4=max(2.2)"
+        type: choice
+        options: ["0", "1", "2", "3", "4"]
+        default: "2"
+      stretch_v:
+        description: "Étirement VERTICAL (+10% par niveau)"
+        type: choice
+        options: ["0", "1", "2", "3"]
+        default: "0"
+      stretch_h:
+        description: "Étirement HORIZONTAL (+10% par niveau)"
+        type: choice
+        options: ["0", "1", "2", "3"]
+        default: "0"
+      render_res:
+        description: "Résolution de rendu en % de l'écran (plus bas = plus de FPS)"
+        type: choice
+        options: ["100", "75", "50"]
+        default: "100"
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    env:
+      APKTOOL_VERSION: "2.10.0"
+      APK_URL: ${{ inputs.apk_url }}
+      SAT_LEVEL: ${{ inputs.saturation }}
+      STRETCH_V: ${{ inputs.stretch_v }}
+      STRETCH_H: ${{ inputs.stretch_h }}
+      RENDER_RES: ${{ inputs.render_res }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ---------- 1. Récupérer l'APK ----------
+      - name: Récupérer l'APK
+        run: |
+          mkdir -p build
+          if [ -n "$APK_URL" ]; then
+            curl -fL "$APK_URL" -o build/game.apk
+          else
+            cp apk/game.apk build/game.apk
+          fi
+          ls -lh build/game.apk
+
+      # ---------- 2. Outils ----------
+      - name: Télécharger apktool et repérer les outils Android
+        run: |
+          curl -fL -o build/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          AJ=$(ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1)/android.jar
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          echo "AJ=$AJ" >> "$GITHUB_ENV"
+
+      # ---------- 3. Décompiler (sans toucher aux ressources) ----------
+      - name: Décompiler
+        run: java -jar build/apktool.jar d -f -r build/game.apk -o build/work
+
+      # ---------- 4. Trouver l'activité de lancement ----------
+      - name: Trouver l'activité de démarrage
+        run: |
+          ACT=$("$BT/aapt2" dump badging build/game.apk | sed -n "s/.*launchable-activity: name='\([^']*\)'.*/\1/p" | head -1)
+          echo "Activité de lancement : $ACT"
+          [ -n "$ACT" ] || { echo "Activité introuvable"; exit 1; }
+          echo "LAUNCH_ACT=$ACT" >> "$GITHUB_ENV"
+
+      # ---------- 5. Générer la classe Tweaker avec les réglages choisis ----------
+      - name: Générer Tweaker.java
+        run: |
+          case "$SAT_LEVEL" in
+            0) SAT=1.0 ;; 1) SAT=1.2 ;; 2) SAT=1.5 ;; 3) SAT=1.8 ;; 4) SAT=2.2 ;;
+          esac
+          SX=$(awk "BEGIN{printf \"%.2f\", 1+0.1*$STRETCH_H}")
+          SY=$(awk "BEGIN{printf \"%.2f\", 1+0.1*$STRETCH_V}")
+          echo "Saturation=$SAT  ScaleX=$SX  ScaleY=$SY  Rendu=$RENDER_RES%"
+
+          cat > build/Tweaker.java <<'JAVA'
+          package patch;
+
+          import android.app.Activity;
+          import android.graphics.ColorMatrix;
+          import android.graphics.ColorMatrixColorFilter;
+          import android.graphics.Paint;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
+          import android.view.SurfaceView;
+          import android.view.View;
+          import android.view.ViewGroup;
+
+          public final class Tweaker {
+              static final float SAT = @SAT@f;
+              static final float SX = @SX@f;
+              static final float SY = @SY@f;
+              static final int RES = @RES@;
+              static int tries = 0;
+              static boolean done = false;
+
+              // Appelée depuis onCreate de l'activité du jeu
+              public static void apply(final Activity a) {
+                  final Handler h = new Handler(Looper.getMainLooper());
+                  h.post(new Runnable() {
+                      public void run() {
+                          if (done) return;
+                          try {
+                              View root = a.getWindow().getDecorView();
+                              SurfaceView sv = find(root);
+                              if (sv != null && sv.getWidth() > 0) {
+                                  tweak(a, sv);
+                                  done = true;
+                              } else if (tries++ < 60) {
+                                  h.postDelayed(this, 250);
+                              }
+                          } catch (Throwable t) {
+                              // ne jamais faire planter le jeu
+                          }
+                      }
+                  });
+              }
+
+              static SurfaceView find(View v) {
+                  if (v instanceof SurfaceView) return (SurfaceView) v;
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) {
+                          SurfaceView r = find(g.getChildAt(i));
+                          if (r != null) return r;
+                      }
+                  }
+                  return null;
+              }
+
+              static void tweak(Activity a, SurfaceView sv) {
+                  // 1) Résolution de rendu (moins de pixels = plus de FPS, image étirée sur l'écran)
+                  if (RES < 100) {
+                      DisplayMetrics m = new DisplayMetrics();
+                      a.getWindowManager().getDefaultDisplay().getRealMetrics(m);
+                      sv.getHolder().setFixedSize(m.widthPixels * RES / 100, m.heightPixels * RES / 100);
+                  }
+                  // 2) Étirement vertical / horizontal (le centre reste fixe, les bords sont rognés)
+                  if (SX != 1f || SY != 1f) {
+                      sv.setScaleX(SX);
+                      sv.setScaleY(SY);
+                  }
+                  // 3) Saturation (voir limites dans les notes)
+                  if (SAT != 1f) {
+                      ColorMatrix cm = new ColorMatrix();
+                      cm.setSaturation(SAT);
+                      Paint p = new Paint();
+                      p.setColorFilter(new ColorMatrixColorFilter(cm));
+                      View parent = (View) sv.getParent();
+                      parent.setLayerType(View.LAYER_TYPE_HARDWARE, p);
+                  }
+              }
+          }
+          JAVA
+
+          sed -i "s/@SAT@/$SAT/; s/@SX@/$SX/; s/@SY@/$SY/; s/@RES@/$RENDER_RES/" build/Tweaker.java
+
+      # ---------- 6. Compiler la classe en .dex ----------
+      - name: Compiler Tweaker en dex
+        run: |
+          mkdir -p build/cls build/dexout
+          javac --release 8 -cp "$AJ" -d build/cls build/Tweaker.java
+          "$BT/d8" --release --lib "$AJ" --output build/dexout $(find build/cls -name '*.class')
+          ls build/dexout
+
+      # ---------- 7. Brancher Tweaker.apply() dans le onCreate du jeu ----------
+      - name: Patcher le smali
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          cls = os.environ["LAUNCH_ACT"].replace(".", "/")
+          call = "\n    invoke-static {p0}, Lpatch/Tweaker;->apply(Landroid/app/Activity;)V\n"
+          for _ in range(8):
+              found = glob.glob(f"build/work/smali*/{cls}.smali")
+              if not found:
+                  sys.exit(f"smali introuvable pour {cls}")
+              path = found[0]
+              src = open(path, encoding="utf-8").read()
+              m = re.search(r"invoke-super \{p0, p1\}, L[^;]+;->onCreate\(Landroid/os/Bundle;\)V", src)
+              if m:
+                  src = src[:m.end()] + call + src[m.end():]
+                  open(path, "w", encoding="utf-8").write(src)
+                  print("Patché :", path)
+                  break
+              # pas de onCreate ici : on remonte à la classe parente
+              cls = re.search(r"^\.super L([^;]+);", src, re.M).group(1)
+          else:
+              sys.exit("onCreate introuvable")
+          PY
+
+      # ---------- 8. Recompiler + ajouter le dex ----------
+      - name: Recompiler
+        run: |
+          java -jar build/apktool.jar b build/work -o build/unsigned.apk
+          N=$(unzip -Z1 build/unsigned.apk | grep -E '^classes[0-9]*\.dex$' \
+              | sed -E 's/^classes([0-9]*)\.dex$/\1/; s/^$/1/' | sort -n | tail -1)
+          NEXT=$((N+1))
+          cp build/dexout/classes.dex "build/classes${NEXT}.dex"
+          (cd build && zip -q unsigned.apk "classes${NEXT}.dex")
+          unzip -Z1 build/unsigned.apk | grep -E '^classes[0-9]*\.dex$'
+
+      # ---------- 9. Aligner + signer ----------
+      - name: Aligner et signer
+        run: |
+          "$BT/zipalign" -p -f 4 build/unsigned.apk build/aligned.apk
+          if [ -f debug.jks ]; then
+            cp debug.jks build/debug.jks
+          else
+            keytool -genkeypair -keystore build/debug.jks -storepass android -keypass android \
+              -alias patch -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=patch"
+            echo "NEW_KEYSTORE=1" >> "$GITHUB_ENV"
+          fi
+          "$BT/apksigner" sign --ks build/debug.jks --ks-pass pass:android --key-pass pass:android \
+            --out build/patched.apk build/aligned.apk
+          "$BT/apksigner" verify build/patched.apk && echo "Signature OK"
+
+      # ---------- 10. Résultat ----------
+      - name: Envoyer l'APK patché
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-sat${{ inputs.saturation }}-v${{ inputs.stretch_v }}-h${{ inputs.stretch_h }}-res${{ inputs.render_res }}
+          path: build/patched.apk
+
+      - name: Envoyer la clé (nouvelle clé seulement)
+        if: env.NEW_KEYSTORE == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-keystore
+          path: build/debug.jks
